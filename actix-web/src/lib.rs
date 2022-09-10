@@ -115,6 +115,7 @@ pub use crate::server::HttpServer;
 pub use crate::types::Either;
 
 pub use actix_http::{body, HttpMessage};
+pub use actix_server::MPTCP;
 
 #[cfg(feature = "cookies")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cookies")))]

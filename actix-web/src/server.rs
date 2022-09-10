@@ -8,7 +8,7 @@ use std::{
 };
 
 use actix_http::{body::MessageBody, Extensions, HttpService, KeepAlive, Request, Response};
-use actix_server::{Server, ServerBuilder};
+use actix_server::{Server, ServerBuilder, MPTCP};
 use actix_service::{
     map_config, IntoServiceFactory, Service, ServiceFactory, ServiceFactoryExt as _,
 };
@@ -73,6 +73,7 @@ where
     config: Arc<Mutex<Config>>,
     backlog: u32,
     sockets: Vec<Socket>,
+    mptcp: MPTCP,
     builder: ServerBuilder,
     #[allow(clippy::type_complexity)]
     on_connect_fn: Option<Arc<dyn Fn(&dyn Any, &mut Extensions) + Send + Sync>>,
@@ -107,6 +108,7 @@ where
             })),
             backlog: 1024,
             sockets: Vec::new(),
+            mptcp: MPTCP::Disabled,
             builder: ServerBuilder::default(),
             on_connect_fn: None,
             _phantom: PhantomData,
@@ -141,6 +143,26 @@ where
     pub fn backlog(mut self, backlog: u32) -> Self {
         self.backlog = backlog;
         self.builder = self.builder.backlog(backlog);
+        self
+    }
+
+    /// Enable the MPTCP protocol at the socket level.
+    ///
+    /// This enable the Multiple Path TCP protocol at the socket level. This means it's managed
+    /// by the kernel and the application (userspace) doesn't have to deal with path management.
+    ///
+    /// Only available in Linux Kernel >= 5.6. If you try to set it on a Windows machine or on
+    /// an older Linux machine, this will fail with a panic.
+    ///
+    /// In Addition to a recent Linux Kernel, you also need to enable the sysctl (if it's not on
+    /// by default):
+    /// `sysctl sysctl net.mptcp.enabled=1`
+    ///
+    /// This method will have no effect if called after a `bind()`.
+    #[cfg(target_os = "linux")]
+    pub fn mptcp(mut self, mptcp_enabled: MPTCP) -> Self {
+        self.mptcp = mptcp_enabled;
+        self.builder = self.builder.mptcp(mptcp_enabled);
         self
     }
 
@@ -254,6 +276,7 @@ where
             config: self.config,
             backlog: self.backlog,
             sockets: self.sockets,
+            mptcp: self.mptcp,
             builder: self.builder,
             on_connect_fn: Some(Arc::new(f)),
             _phantom: PhantomData,
@@ -354,7 +377,7 @@ where
         let mut sockets = Vec::new();
 
         for addr in addrs.to_socket_addrs()? {
-            match create_tcp_listener(addr, self.backlog) {
+            match create_tcp_listener(addr, self.backlog, &self.mptcp) {
                 Ok(lst) => {
                     success = true;
                     sockets.push(lst);
@@ -724,10 +747,33 @@ where
     }
 }
 
-fn create_tcp_listener(addr: net::SocketAddr, backlog: u32) -> io::Result<net::TcpListener> {
+fn create_tcp_listener(
+    addr: net::SocketAddr,
+    backlog: u32,
+    mptcp: &MPTCP,
+) -> io::Result<net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
-    let domain = Domain::for_address(addr);
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+
+    #[cfg(not(target_os = "linux"))]
+    let protocol = Protocol::TCP;
+    #[cfg(target_os = "linux")]
+    let protocol = if mptcp == &MPTCP::Disabled {
+        Protocol::TCP
+    } else {
+        Protocol::MPTCP
+    };
+
+    let socket = match Socket::new(Domain::for_address(addr), Type::STREAM, Some(protocol)) {
+        Ok(sock) => sock,
+        Err(err) => {
+            if mptcp == &MPTCP::TcpFallback {
+                Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?
+            } else {
+                return Err(err);
+            }
+        }
+    };
+
     socket.set_reuse_address(true)?;
     socket.bind(&addr.into())?;
     // clamp backlog to max u32 that fits in i32 range
